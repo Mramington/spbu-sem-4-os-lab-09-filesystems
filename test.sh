@@ -10,30 +10,37 @@ fail() { echo "  [FAIL] $*"; FAIL=$((FAIL+1)); }
 
 inode_of() { debugfs -R "stat $1" "$IMG" 2>/dev/null | awk '/^Inode:/{print $2}'; }
 
+# -------------------------------------------------
 echo "=== 1. Создание образа ==="
 
-if [ ! -f "$IMG" ]; then
-    truncate --size=256M "$IMG"
-    mkfs.ext2 -b 2048 -N 512 "$IMG" >/dev/null 2>&1
-    echo "  Создан $IMG (256M, блок 2K, 512 инод)"
-else
-    echo "  Используется существующий $IMG"
-fi
+truncate --size=256M "$IMG"
+mkfs.ext2 -b 2048 -N 512 "$IMG" >/dev/null 2>&1
+echo "  Создан $IMG (256M, блок 2K, 512 инод)"
 
+# -----------------------------------------------
 echo "=== 2. Заполнение образа ==="
 
+# Генерируем файлы во временной директории на Linux-ФС (/tmp)
 TMP=$(mktemp -d -p /tmp)
 trap 'rm -rf "$TMP"' EXIT
 
+# small.txt — умещается в прямые блоки
 printf 'Hello, ext2!\n' > "$TMP/small.txt"
 
-# medium.bin — 40 KiB при блоке 2K = 20 блоков > 12 -> нужна косвенная адресация
+# medium.bin — 40 KiB при блоке 2K = 20 блоков > 12 → нужна косвенная адресация
 dd if=/dev/urandom bs=1024 count=40 of="$TMP/medium.bin" 2>/dev/null
 
 # sparse.bin — разреженный файл >4G, преимущественно пустой
 truncate --size=5G "$TMP/sparse.bin"
 printf 'SPARSE_BEGIN' | dd of="$TMP/sparse.bin" bs=1 seek=0            conv=notrunc 2>/dev/null
 printf 'SPARSE__END_' | dd of="$TMP/sparse.bin" bs=1 seek=$((5*1024*1024*1024-12)) conv=notrunc 2>/dev/null
+
+_sp_sz=$(wc -c < "$TMP/sparse.bin")
+if [ "$_sp_sz" -ne $((5*1024*1024*1024)) ]; then
+    echo "  ОШИБКА: sparse.bin в $TMP имеет размер $_sp_sz, ожидали $((5*1024*1024*1024))" >&2
+    echo "  Убедитесь что /tmp смонтирован как tmpfs (Linux), а не NTFS (WSL /mnt/c)" >&2
+    exit 1
+fi
 
 # файлы в подкаталогах
 printf 'file in subdir\n' > "$TMP/sub.txt"
@@ -43,14 +50,15 @@ debugfs -w "$IMG" <<EOF >/dev/null 2>&1
 mkdir /dira
 mkdir /dirb
 mkdir /dirb/sub
-write $TMP/small.txt /small.txt
-write $TMP/medium.bin /medium.bin
-write $TMP/sparse.bin /sparse.bin
-write $TMP/sub.txt /dira/sub.txt
-write $TMP/nested.txt /dirb/sub/nested.txt
+write $TMP/small.txt   /small.txt
+write $TMP/medium.bin  /medium.bin
+write $TMP/sparse.bin  /sparse.bin
+write $TMP/sub.txt     /dira/sub.txt
+write $TMP/nested.txt  /dirb/sub/nested.txt
 EOF
 echo "  Образ заполнен"
 
+# Запоминаем номера инод
 INO_ROOT=$(inode_of /)
 INO_DIRA=$(inode_of /dira)
 INO_DIRB=$(inode_of /dirb)
@@ -66,7 +74,7 @@ echo "         small=$INO_SMALL medium=$INO_MEDIUM sparse=$INO_SPARSE"
 echo "         sub.txt=$INO_SUBTXT nested.txt=$INO_NESTED"
 
 mkdir -p "$OUT"
-"$D/ext2cat" "$IMG" "$INO_SMALL" > "$OUT/small.txt"
+"$D/ext2cat" "$IMG" "$INO_SMALL"  > "$OUT/small.txt"
 "$D/ext2cat" "$IMG" "$INO_MEDIUM" > "$OUT/medium.bin"
 "$D/ext2cat" "$IMG" "$INO_SUBTXT" > "$OUT/sub.txt"
 "$D/ext2cat" "$IMG" "$INO_NESTED" > "$OUT/nested.txt"
@@ -75,9 +83,10 @@ sha512sum "$OUT/small.txt" "$OUT/medium.bin" "$OUT/sub.txt" "$OUT/nested.txt" \
     > "$OUT/checksums.sha512"
 echo "  Контрольные суммы сохранены в $OUT/checksums.sha512"
 
-# -----------------------------------------
+# ----------------------------------------
 echo "=== 3. ext2info ==="
 
+# Тип файла
 if "$D/ext2info" "$IMG" "$INO_SMALL" 2>/dev/null | grep -q "regular file"; then
     ok "small.txt — regular file"
 else
@@ -111,13 +120,14 @@ else
     fail "sparse.bin — карта блоков содержит дыры"
 fi
 
-# -----------------------------------------
+# ------------------------------------------------------
 echo "=== 4. ext2cat ==="
 
 # Сверяем sha512 через пайп: yourgetinodedata ext2.img inode | sha512sum
 while IFS='  ' read -r want path; do
     fname="${path##*/}"
     ino=$(inode_of "/${path#$OUT/}" 2>/dev/null) || true
+    # получаем inode из имени файла
     case "$fname" in
         small.txt)  ino=$INO_SMALL  ;;
         medium.bin) ino=$INO_MEDIUM ;;
@@ -141,10 +151,9 @@ else
     fail "sparse.bin — ожидали $((5*1024*1024*1024)), получили $sparse_bytes"
 fi
 
-# -----------------------------------------
+# ----------------------------------------------------
 echo "=== 5. ext2ls ==="
 
-# Проверяем имена и inode через пайп ext2cat | ext2ls
 check_dir() {
     local dir_ino="$1" name="$2" exp_ino="$3"
     local listing
@@ -169,16 +178,16 @@ check_dir "$INO_DIRA"  "sub.txt"    "$INO_SUBTXT"
 check_dir "$INO_DIRB"  "sub"        "$INO_SUB"
 check_dir "$INO_SUB"   "nested.txt" "$INO_NESTED"
 
-# --------------------------------------------
+# ---------------------------------------------
 echo "=== 6. loop-устройство ==="
 
 if ! command -v losetup >/dev/null 2>&1; then
     echo "  losetup не найден, пропускаем"
 elif LOOP=$(sudo losetup -f 2>/dev/null); then
     sudo losetup "$LOOP" "$IMG"
+    sudo chmod o+r "$LOOP"
     echo "  $IMG → $LOOP  ($(lsblk -no size,fstype "$LOOP" 2>/dev/null || true))"
 
-    # ext2info, ext2cat, ext2ls — те же тесты, но устройство вместо файла
     if "$D/ext2info" "$LOOP" "$INO_MEDIUM" 2>/dev/null | grep -qi "indirect"; then
         ok "loop: ext2info medium.bin — косвенные блоки"
     else
@@ -215,7 +224,6 @@ else
     echo "  sudo losetup недоступен, пропускаем"
 fi
 
-# --------------------------------------------
 echo ""
 echo "Результат: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

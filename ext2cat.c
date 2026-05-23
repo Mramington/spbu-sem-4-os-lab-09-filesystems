@@ -1,168 +1,185 @@
-#define _POSIX_C_SOURCE 200809L
-#include "ext2.h"
-#include <time.h>
-#include <inttypes.h>
-#include <stdio.h>
-#include <stdlib.h>
-
-const char *filetype_str(uint16_t mode)
-{
-    switch (mode & 0xF000) {
-    case EXT2_S_IFREG:  return "regular file";
-    case EXT2_S_IFDIR:  return "directory";
-    case EXT2_S_IFLNK:  return "symbolic link";
-    case EXT2_S_IFBLK:  return "block device";
-    case EXT2_S_IFCHR:  return "character device";
-    case EXT2_S_IFIFO:  return "fifo";
-    case EXT2_S_IFSOCK: return "socket";
-    default:            return "unknown";
-    }
-}
-
-void print_perms(uint16_t mode)
-{
-    char s[11];
-    uint16_t fmt = mode & 0xF000;
-    s[0] = (fmt == EXT2_S_IFDIR)  ? 'd' :
-            (fmt == EXT2_S_IFLNK)  ? 'l' :
-            (fmt == EXT2_S_IFBLK)  ? 'b' :
-            (fmt == EXT2_S_IFCHR)  ? 'c' :
-            (fmt == EXT2_S_IFIFO)  ? 'p' :
-            (fmt == EXT2_S_IFSOCK) ? 's' : '-';
-    s[1] = (mode & 0400) ? 'r' : '-';
-    s[2] = (mode & 0200) ? 'w' : '-';
-    s[3] = (mode & 0100) ? ((mode & 04000) ? 's' : 'x')
-                           : ((mode & 04000) ? 'S' : '-');
-    s[4] = (mode & 0040) ? 'r' : '-';
-    s[5] = (mode & 0020) ? 'w' : '-';
-    s[6] = (mode & 0010) ? ((mode & 02000) ? 's' : 'x')
-                           : ((mode & 02000) ? 'S' : '-');
-    s[7] = (mode & 0004) ? 'r' : '-';
-    s[8] = (mode & 0002) ? 'w' : '-';
-    s[9] = (mode & 0001) ? ((mode & 01000) ? 't' : 'x')
-                           : ((mode & 01000) ? 'T' : '-');
-    s[10] = '\0';
-    printf("  %-12s %s  (octal %04o)\n", "Mode:", s, mode & 07777);
-}
-
-void print_time(const char *label, uint32_t t)
-{
-    time_t tt = (time_t)t;
-    char buf[64];
-    struct tm *tm = gmtime(&tt);
-    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", tm);
-    printf("  %-12s %s\n", label, buf);
-}
-
-#define MAX_SHOW 64u
-
-void print_block_map(ext2_fs_t *fs, ext2_inode_t *inode, uint64_t size)
-{
-    uint32_t block_size = fs->block_size;
-    uint64_t num_logical = (size + block_size - 1) / block_size;
-
-    printf("\n--- Logical block map");
-    if (num_logical == 0) {
-        printf(" (empty file) ---\n");
-        return;
-    }
-    printf(" (%" PRIu64 " logical blocks", num_logical);
-    if (num_logical > MAX_SHOW)
-        printf(", showing first %u", MAX_SHOW);
-    printf(") ---\n");
-
-    uint64_t show = (num_logical < MAX_SHOW) ? num_logical : MAX_SHOW;
-    uint64_t holes = 0;
-
-    for (uint64_t i = 0; i < show; i++) {
-        uint32_t phys = ext2_inode_get_block(fs, inode, (uint32_t)i);
-        if (phys == (uint32_t)-1) {
-            fprintf(stderr, "  Error resolving logical block %" PRIu64 "\n", i);
-            break;
-        }
-        if (phys == 0) {
-            printf("  logical[%6" PRIu64 "] -> hole (sparse)\n", i);
-            holes++;
-        } else {
-            printf("  logical[%6" PRIu64 "] -> physical block %u\n", i, phys);
-        }
-    }
-    if (num_logical > MAX_SHOW)
-        printf("  ... (%" PRIu64 " more logical blocks not shown)\n",
-               num_logical - MAX_SHOW);
-    if (holes > 0)
-        printf("  (%llu hole(s) in shown range)\n", (unsigned long long)holes);
-}
-
-int main(int argc, char *argv[])
-{
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <image-or-device> <inode-number>\n", argv[0]);
-        return 1;
-    }
-
-    char *endp;
-    unsigned long ino_arg = strtoul(argv[2], &endp, 10);
-    if (*endp != '\0' || ino_arg == 0) {
-        fprintf(stderr, "Invalid inode number: %s\n", argv[2]);
-        return 1;
-    }
-
-    ext2_fs_t fs;
-    if (ext2_open(argv[1], &fs) != 0) return 1;
-
-    ext2_inode_t inode;
-    if (ext2_read_inode(&fs, (uint32_t)ino_arg, &inode) != 0) {
-        ext2_close(&fs);
-        return 1;
-    }
-
-    uint16_t mode  = le16(inode.i_mode);
-    uint64_t size  = ext2_inode_size(&inode);
-    uint32_t uid   = le16(inode.i_uid);
-    uint32_t gid   = le16(inode.i_gid);
-    uint32_t links = le16(inode.i_links_count);
-    uint32_t blks  = le32(inode.i_blocks);
-    uint32_t flags = le32(inode.i_flags);
-
-    printf("=== Inode %lu on %s ===\n\n", ino_arg, argv[1]);
-    printf("  %-12s %s\n", "Type:", filetype_str(mode));
-    print_perms(mode);
-    printf("  %-12s %u\n",          "UID:",    uid);
-    printf("  %-12s %u\n",          "GID:",    gid);
-    printf("  %-12s %" PRIu64 " bytes\n", "Size:", size);
-    printf("  %-12s %u  (= %" PRIu64 " bytes in 512-unit blocks)\n",
-           "i_blocks:", blks, (uint64_t)blks * 512);
-    printf("  %-12s %u\n",          "Links:",  links);
-    printf("  %-12s 0x%08x\n",      "Flags:",  flags);
-    printf("  %-12s %u\n",          "Generation:", le32(inode.i_generation));
-    print_time("atime:", le32(inode.i_atime));
-    print_time("ctime:", le32(inode.i_ctime));
-    print_time("mtime:", le32(inode.i_mtime));
-    if (le32(inode.i_dtime))
-        print_time("dtime:", le32(inode.i_dtime));
-
-    printf("\n--- Block pointer fields (i_block[]) ---\n");
-    printf("  Direct blocks (i_block[0..11]):\n");
-    for (int i = 0; i < EXT2_NDIR_BLOCKS; i++) {
-        uint32_t b = le32(inode.i_block[i]);
-        if (b)
-            printf("    [%2d] physical block %u\n", i, b);
-        else
-            printf("    [%2d] 0 (hole)\n", i);
-    }
-    printf("  Indirect block pointer  (i_block[12]): %u%s\n",
-           le32(inode.i_block[EXT2_IND_BLOCK]),
-           le32(inode.i_block[EXT2_IND_BLOCK]) ? "" : "  (not used)");
-    printf("  Dbl-indirect pointer    (i_block[13]): %u%s\n",
-           le32(inode.i_block[EXT2_DIND_BLOCK]),
-           le32(inode.i_block[EXT2_DIND_BLOCK]) ? "" : "  (not used)");
-    printf("  Tri-indirect pointer    (i_block[14]): %u%s\n",
-           le32(inode.i_block[EXT2_TIND_BLOCK]),
-           le32(inode.i_block[EXT2_TIND_BLOCK]) ? "" : "  (not used)");
-
-    print_block_map(&fs, &inode, size);
-
-    ext2_close(&fs);
-    return 0;
-}
+ #define _POSIX_C_SOURCE 200809L
+ #include "ext2.h"
+ #include <inttypes.h>
+ 
+ int write_all(const uint8_t *buf, size_t n)
+ {
+     while (n > 0) {
+         ssize_t w = write(STDOUT_FILENO, buf, n);
+         if (w <= 0) { perror("write"); return -1; }
+         buf += w;
+         n   -= (size_t)w;
+     }
+     return 0;
+ }
+ 
+ ssize_t emit_block(ext2_fs_t *fs, uint32_t blk,
+                            uint64_t remaining, uint8_t *buf)
+ {
+     size_t n = (remaining < fs->block_size)
+                ? (size_t)remaining
+                : (size_t)fs->block_size;
+ 
+     if (blk == 0) {
+         memset(buf, 0, n);
+     } else {
+         if (ext2_read_block(fs, blk, buf) != 0)
+             return -1;
+     }
+ 
+     return write_all(buf, n) == 0 ? (ssize_t)n : -1;
+ }
+ 
+ int emit_hole(ext2_fs_t *fs, uint64_t count,
+                      uint64_t *remaining, uint8_t *buf)
+ {
+     for (uint64_t i = 0; i < count && *remaining > 0; i++) {
+         ssize_t w = emit_block(fs, 0, *remaining, buf);
+         if (w < 0) return -1;
+         *remaining -= (uint64_t)w;
+     }
+     return 0;
+ }
+ int emit_single_indirect(ext2_fs_t *fs, uint32_t ind,
+                                  uint64_t *remaining, uint8_t *buf,
+                                  uint8_t *ibuf)
+ {
+     uint32_t ptrs = fs->block_size / 4;
+ 
+     if (ind == 0)
+         return emit_hole(fs, ptrs, remaining, buf);
+ 
+     if (ext2_read_block(fs, ind, ibuf) != 0)
+         return -1;
+ 
+     for (uint32_t i = 0; i < ptrs && *remaining > 0; i++) {
+         uint32_t blk = le32(((uint32_t *)ibuf)[i]);
+         ssize_t w = emit_block(fs, blk, *remaining, buf);
+         if (w < 0) return -1;
+         *remaining -= (uint64_t)w;
+     }
+     return 0;
+ }
+ 
+ int emit_double_indirect(ext2_fs_t *fs, uint32_t dind,
+                                  uint64_t *remaining, uint8_t *buf,
+                                  uint8_t *ibuf, uint8_t *dibuf)
+ {
+     uint32_t ptrs = fs->block_size / 4;
+ 
+     if (dind == 0)
+         return emit_hole(fs, (uint64_t)ptrs * ptrs, remaining, buf);
+ 
+     if (ext2_read_block(fs, dind, dibuf) != 0)
+         return -1;
+ 
+     for (uint32_t i = 0; i < ptrs && *remaining > 0; i++) {
+         uint32_t ind = le32(((uint32_t *)dibuf)[i]);
+         if (emit_single_indirect(fs, ind, remaining, buf, ibuf) != 0)
+             return -1;
+     }
+     return 0;
+ }
+ 
+ int emit_triple_indirect(ext2_fs_t *fs, uint32_t tind,
+                                  uint64_t *remaining, uint8_t *buf,
+                                  uint8_t *ibuf, uint8_t *dibuf, uint8_t *tibuf)
+ {
+     uint32_t ptrs = fs->block_size / 4;
+ 
+     if (tind == 0)
+         return emit_hole(fs, (uint64_t)ptrs * ptrs * ptrs, remaining, buf);
+ 
+     if (ext2_read_block(fs, tind, tibuf) != 0)
+         return -1;
+ 
+     for (uint32_t i = 0; i < ptrs && *remaining > 0; i++) {
+         uint32_t dind = le32(((uint32_t *)tibuf)[i]);
+         if (emit_double_indirect(fs, dind, remaining, buf, ibuf, dibuf) != 0)
+             return -1;
+     }
+     return 0;
+ }
+ 
+ int main(int argc, char *argv[])
+ {
+     if (argc != 3) {
+         fprintf(stderr, "Использование: %s <образ|устройство> <номер_иноды>\n",
+                 argv[0]);
+         return 1;
+     }
+ 
+     ext2_fs_t fs;
+     if (ext2_open(argv[1], &fs) != 0)
+         return 1;
+ 
+     uint32_t ino = (uint32_t)strtoul(argv[2], NULL, 10);
+     ext2_inode_t inode;
+     if (ext2_read_inode(&fs, ino, &inode) != 0) {
+         close(fs.fd); return 1;
+     }
+ 
+     uint16_t mode = le16(inode.i_mode);
+     uint16_t fmt  = mode & 0xF000;
+ 
+     if (fmt == EXT2_S_IFLNK && le32(inode.i_blocks) == 0) {
+         uint32_t sz = le32(inode.i_size);
+         if (sz <= 60) {
+             write_all((uint8_t *)inode.i_block, sz);
+             close(fs.fd);
+             return 0;
+         }
+     }
+ 
+     if (fmt != EXT2_S_IFREG && fmt != EXT2_S_IFDIR && fmt != EXT2_S_IFLNK) {
+         fprintf(stderr, "Inode %u: не файл, каталог или симлинк\n", ino);
+         close(fs.fd); return 1;
+     }
+ 
+     uint64_t size = (uint64_t)le32(inode.i_size);
+     if (fmt == EXT2_S_IFREG)
+         size |= (uint64_t)le32(inode.i_dir_acl) << 32;
+ 
+     if (size == 0) {
+         close(fs.fd); return 0;
+     }
+ 
+     uint8_t *buf   = malloc(fs.block_size);
+     uint8_t *ibuf  = malloc(fs.block_size);
+     uint8_t *dibuf = malloc(fs.block_size);
+     uint8_t *tibuf = malloc(fs.block_size);
+     if (!buf || !ibuf || !dibuf || !tibuf) {
+         perror("malloc");
+         free(buf); free(ibuf); free(dibuf); free(tibuf);
+         close(fs.fd); return 1;
+     }
+ 
+     uint64_t remaining = size;
+     int rc = 0;
+ 
+     for (uint32_t i = 0; i < EXT2_NDIR_BLOCKS && remaining > 0; i++) {
+         ssize_t w = emit_block(&fs, le32(inode.i_block[i]), remaining, buf);
+         if (w < 0) { rc = -1; goto done; }
+         remaining -= (uint64_t)w;
+     }
+ 
+     if (remaining > 0)
+         if (emit_single_indirect(&fs, le32(inode.i_block[EXT2_IND_BLOCK]),
+                                   &remaining, buf, ibuf) != 0)
+             { rc = -1; goto done; }
+ 
+     if (remaining > 0)
+         if (emit_double_indirect(&fs, le32(inode.i_block[EXT2_DIND_BLOCK]),
+                                   &remaining, buf, ibuf, dibuf) != 0)
+             { rc = -1; goto done; }
+ 
+     if (remaining > 0)
+         if (emit_triple_indirect(&fs, le32(inode.i_block[EXT2_TIND_BLOCK]),
+                                   &remaining, buf, ibuf, dibuf, tibuf) != 0)
+             { rc = -1; goto done; }
+ 
+ done:
+     free(buf); free(ibuf); free(dibuf); free(tibuf);
+     close(fs.fd);
+     return (rc < 0) ? 1 : 0;
+ }

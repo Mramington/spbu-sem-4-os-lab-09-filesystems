@@ -300,7 +300,7 @@ done:
     return result;
 }
 
-void ext2_close(ext2_fs_t *fs)
+static inline void ext2_close(ext2_fs_t *fs)
 {
     if (fs && fs->fd >= 0) { close(fs->fd); fs->fd = -1; }
 }
